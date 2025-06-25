@@ -16,81 +16,118 @@ import torch
 
 class DeepAttnMIL_Surv(nn.Module):
     """
-    Deep AttnMISL Model definition
+    Deep AttnMISL Model with clinical feature cross-attention (single direction)
     """
 
-    def __init__(self, cluster_num):
+    def __init__(self, cluster_num, clinical_dim=27, clinical_emb_dim=64, cross_attn_heads=1, attn_emb_dim=64):
+        '''
+        cluster_num: int, number of clusters
+        clinical_dim: int, dimension of input clinical_param vector
+        clinical_emb_dim: int, dimension of clinical embedding
+        cross_attn_heads: int, number of heads for cross-attention
+        attn_emb_dim: int, WSI feature embedding dim (should match clinical_emb_dim for cross-attn)
+        '''
         super(DeepAttnMIL_Surv, self).__init__()
-        self.embedding_net = nn.Sequential(nn.Conv2d(4096, 64, 1),
-                                     nn.ReLU(),
-                                     nn.AdaptiveAvgPool2d((1,1))
-                                     )
+        self.cluster_num = cluster_num
+        self.attn_emb_dim = attn_emb_dim
 
-
-        self.attention = nn.Sequential(
-            nn.Linear(64, 32), # V
-            nn.Tanh(),
-            nn.Linear(32, 1)  # W
+        # WSI patch feature embedding
+        self.embedding_net = nn.Sequential(
+            nn.Conv2d(2048, attn_emb_dim, 1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1,1))
         )
 
+        # Attention pooling to get bag-level feature
+        self.attention = nn.Sequential(
+            nn.Linear(attn_emb_dim, 32),
+            nn.Tanh(),
+            nn.Linear(32, 1)
+        )
+
+        # Clinical参数MLP embedding
+        self.clinical_mlp = nn.Sequential(
+            nn.Linear(clinical_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, clinical_emb_dim),
+            nn.ReLU()
+        )
+
+        # Cross-Attention
+        self.cross_attn = nn.MultiheadAttention(embed_dim=attn_emb_dim, num_heads=cross_attn_heads, batch_first=True)
+
+        # Survival prediction head
         self.fc6 = nn.Sequential(
-            nn.Linear(64, 32),
+            nn.Linear(attn_emb_dim, 32),
             nn.ReLU(),
             nn.Dropout(p=0.5),
-            nn.Linear(32,1)
+            nn.Linear(32, 1)
         )
-        self.cluster_num = cluster_num
-
-
-    def masked_softmax(self, x, mask=None):
+    
+    def masked_softmax(self, x, mask=None, dim=-1):
         """
         Performs masked softmax, as simply masking post-softmax can be
-        inaccurate
+        inaccurate. 
+        If mask is cluster-level, will be expanded to patch-level inside forward().
         :param x: [batch_size, num_items]
         :param mask: [batch_size, num_items]
         :return:
         """
         if mask is not None:
-            mask = mask.float()
-        if mask is not None:
-            x_masked = x * mask + (1 - 1 / (mask+1e-5))
-        else:
-            x_masked = x
-        x_max = x_masked.max(1)[0]
-        x_exp = (x - x_max.unsqueeze(-1)).exp()
-        if mask is not None:
-            x_exp = x_exp * mask.float()
-        return x_exp / x_exp.sum(1).unsqueeze(-1)
+            x = x.masked_fill(~mask.bool(), -1e9)
+        return torch.softmax(x, dim=dim)
 
-
-    def forward(self, x, mask):
-
-        " x is a tensor list"
+    def forward(self, x, mask, clinical_param):
+        """
+        x: list of cluster_num tensors, each is (N_patch_in_cluster, 2048, 1, 1)
+        mask: (cluster_num,) tensor or (num_total_patches,) tensor
+        clinical_param: (batch, clinical_dim) tensor, batch=1
+        """
+        # 1. Patch embedding
         res = []
+        patches_per_cluster = []
         for i in range(self.cluster_num):
-            hh = x[i]
-            output = self.embedding_net(hh)
-            output = output.view(output.size()[0], -1)
+            hh = x[i]  # (N_patch, 2048, 1, 1)
+            output = self.embedding_net(hh)  # (N_patch, emb_dim, 1, 1)
+            output = output.view(output.size()[0], -1)  # (N_patch, emb_dim)
             res.append(output)
+            patches_per_cluster.append(output.size(0))
+        h = torch.cat(res, dim=0)  # (num_total_patches, emb_dim)
 
-
-        h = torch.cat(res)
-
+        # 2. Attention pooling
         b = h.size(0)
         c = h.size(1)
-
         h = h.view(b, c)
+        A = self.attention(h)  # (num_total_patches, 1)
+        A = torch.transpose(A, 1, 0)  # 1 x num_total_patches
 
-        A = self.attention(h)
-        A = torch.transpose(A, 1, 0)  # KxN
+        # ---- mask扩展逻辑 ----
+        # 如果mask只按cluster_num给出，则扩展到patch级别
+        if mask.dim() == 1 and mask.shape[0] == self.cluster_num:
+            device = mask.device
+            mask_patch = []
+            for i in range(self.cluster_num):
+                mask_patch.append(mask[i].repeat(patches_per_cluster[i]).to(device))
+            mask_patch = torch.cat(mask_patch).unsqueeze(0)  # shape: (1, num_total_patches)
+        else:
+            mask_patch = mask  # 假定已是patch级别
 
-        A = self.masked_softmax(A, mask)
+        A = self.masked_softmax(A, mask_patch)
 
+        M = torch.mm(A, h)  # 1 x emb_dim, 即bag-level特征
 
-        M = torch.mm(A, h)  # KxL
+        # 3. 临床参数MLP
+        clinical_emb = self.clinical_mlp(clinical_param)  # (1, emb_dim)
 
-        Y_pred = self.fc6(M)
+        # 4. 单向 Cross Attention
+        # Query: M (1, emb_dim) -> (batch, seq_len=1, emb_dim)
+        # Key/Value: clinical_emb (1, emb_dim) -> (batch, seq_len=1, emb_dim)
+        query = M.unsqueeze(1)  # (batch=1, seq=1, emb_dim)
+        key = clinical_emb.unsqueeze(1)  # (batch=1, seq=1, emb_dim)
+        value = clinical_emb.unsqueeze(1)  # (batch=1, seq=1, emb_dim)
+        cross_attn_out, _ = self.cross_attn(query, key, value)  # (1, 1, emb_dim)
+        fused = cross_attn_out.squeeze(1)  # (1, emb_dim)
 
-
+        # 5. Survival prediction
+        Y_pred = self.fc6(fused)  # (1, 1)
         return Y_pred
-
