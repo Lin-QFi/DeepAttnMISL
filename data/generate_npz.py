@@ -25,6 +25,32 @@ clinical_file = Path("/media/zsly/2EF669DFF669A833/DeepAttnMISL/data/folder_name
 clinical_df = pd.read_excel(clinical_file)
 clinical_df['patient_ID'] = clinical_df['patient_ID'].astype(str).str.strip()
 
+# ====== 明确需要用的列 ======
+NUMERIC_COLS = ['age', 'BMI', 'CEA', 'CA199', 'CA125', 'CA153', 'AFP']
+BINARY_COLS = ['sex', 'ganzhuanyi', 'feizhuanyi', 'qitazhuanyi', 'maiguanneiaishuan', 'shenjingshujinrun']
+MULTI_CAT_COLS = ['weizhi', 'fenxing', 'fenhua']
+ALL_COLS = NUMERIC_COLS + BINARY_COLS + MULTI_CAT_COLS
+
+# ========== 数值标准化(全队列) ==========
+num_mask = clinical_df[NUMERIC_COLS].notna().all(axis=1)
+num_mean = clinical_df.loc[num_mask, NUMERIC_COLS].mean()
+num_std = clinical_df.loc[num_mask, NUMERIC_COLS].std().replace(0, 1)  # 避免除0
+
+# ========== 多分类变量one-hot编码(获取全类别) ==========
+multi_cat_uniques = {col: sorted(clinical_df[col].dropna().unique()) for col in MULTI_CAT_COLS}
+multi_cat_value2idx = {col: {v: i for i, v in enumerate(vals)} for col, vals in multi_cat_uniques.items()}
+multi_cat_dim = sum(len(v) for v in multi_cat_uniques.values())
+
+# 保存标准化参数以便推理时复现
+norm_param_save_path = output_npz_dir / "clinical_norm_params.npz"
+np.savez(
+    norm_param_save_path,
+    num_mean=num_mean.values.astype(np.float32),
+    num_std=num_std.values.astype(np.float32),
+    num_names=np.array(NUMERIC_COLS),
+    multi_cat_uniques={k: np.array(v) for k, v in multi_cat_uniques.items()}
+)
+
 # ========== 设备设置 ==========
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -42,15 +68,16 @@ preprocess = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
-# ========== 遍历每个 patient ==========
-for patient_dir in tqdm(sorted(patch_root.iterdir()), desc="生成 .npz"):
-    if not patient_dir.is_dir():
+# ========== 只遍历excel里的病人 ==========
+for patient_id in tqdm(clinical_df['patient_ID'], desc="生成 .npz"):
+    patient_patch_dir = patch_root / patient_id
+    if not patient_patch_dir.is_dir():
+        print(f"❌ {patient_id} 无patch文件夹")
         continue
 
-    patient_id = patient_dir.name.strip()
-    patch_paths = sorted(patient_dir.glob("*.jpg"))
+    patch_paths = sorted(patient_patch_dir.glob("*.jpg"))
     if len(patch_paths) == 0:
-        print(f"❌ {patient_id} 无 patch 图像")
+        print(f"❌ {patient_id} patch文件夹为空")
         continue
 
     features = []
@@ -79,6 +106,28 @@ for patient_dir in tqdm(sorted(patch_root.iterdir()), desc="生成 .npz"):
     status_str = match["demographicvitalstatus"].values[0]
     status = 1 if str(status_str).strip().lower() == 'dead' else 0
 
+    # ========== 提取/处理临床参数 ==========
+    try:
+        # 数值型标准化
+        numeric = ((match[NUMERIC_COLS].values[0] - num_mean.values) / num_std.values).astype(np.float32)
+        # 二分类直接取
+        binary = match[BINARY_COLS].values[0].astype(np.float32)
+        # 多分类one-hot
+        multi_cat_onehot = []
+        for col in MULTI_CAT_COLS:
+            val = match[col].values[0]
+            onehot = np.zeros(len(multi_cat_uniques[col]), dtype=np.float32)
+            if pd.notnull(val):
+                idx = multi_cat_value2idx[col].get(val, None)
+                if idx is not None:
+                    onehot[idx] = 1.0
+            multi_cat_onehot.append(onehot)
+        multi_cat_onehot = np.concatenate(multi_cat_onehot, axis=0)
+        clinical_param_vector = np.concatenate([numeric, binary, multi_cat_onehot], axis=0).astype(np.float32)
+    except Exception as e:
+        print(f"❌ {patient_id} 临床参数提取失败: {e}")
+        continue
+
     # ========== 保存 =============
     np.savez(
         output_npz_dir / f"{patient_id}.npz",
@@ -88,6 +137,7 @@ for patient_dir in tqdm(sorted(patch_root.iterdir()), desc="生成 .npz"):
         status=int(status),
         img_path=np.array(img_paths_str),
         cluster_num=cluster_labels.astype(np.int32),
+        clinical_param=clinical_param_vector
     )
 
-    print(f"✅ 生成成功：{patient_id}.npz")
+    print(f"✅ 生成成功：{patient_id}.npz, 临床参数shape: {clinical_param_vector.shape}")
