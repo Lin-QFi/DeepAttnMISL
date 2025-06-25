@@ -24,6 +24,20 @@ def set_seed(seed=666):
     os.environ["PYTHONHASHSEED"] = str(seed)
     set_mil_seed(seed)
 
+def freeze_backbone(model):
+    # 冻结WSI主干参数
+    for param in model.embedding_net.parameters():
+        param.requires_grad = False
+    for param in model.attention.parameters():
+        param.requires_grad = False
+
+def unfreeze_backbone(model):
+    # 解冻WSI主干参数
+    for param in model.embedding_net.parameters():
+        param.requires_grad = True
+    for param in model.attention.parameters():
+        param.requires_grad = True
+
 parser = argparse.ArgumentParser(description='DeepAttnMISL')
 parser.add_argument('--nfolds', type=int, default=5, help='number of folds for cross-validation')
 parser.add_argument('--cluster_num', type=int, default=10, help='cluster number')
@@ -140,12 +154,20 @@ def save_metrics_to_csv(metrics, csv_path):
 
 def train(train_path, test_path, model_save_path, num_epochs, lr, cluster_num=10,
           clinical_dim=27, fold=0, total_folds=5, script_dir=None):
-    # Get train/val loader
+
     trainloader, valloader = MIL_dataloader(data_path=train_path, cluster_num=cluster_num, train=True).get_loader()
-    # Get test loader
     testloader = MIL_dataloader(data_path=test_path, cluster_num=cluster_num, train=False).get_loader()
     model = DeepAttnMIL_Surv(cluster_num=cluster_num, clinical_dim=clinical_dim).cuda()
-    optimizer = torch.optim.Adam(model.parameters(), lr = lr, weight_decay = 5e-4)
+
+    freeze_epochs = 15  # 先只训练cross attn部分的epoch数
+    # 1. 先冻结主干，只训cross attn/mlp/fc6
+    freeze_backbone(model)
+    params_to_train = []
+    params_to_train += list(model.clinical_mlp.parameters())
+    params_to_train += list(model.cross_attn.parameters())
+    params_to_train += list(model.fc6.parameters())
+    optimizer = torch.optim.Adam(params_to_train, lr = lr, weight_decay = 5e-4)
+
     early_stopping = EarlyStopping(model_path=model_save_path, patience=15, verbose=True)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     save_epoch = range(10, 100, 5)
@@ -153,7 +175,6 @@ def train(train_path, test_path, model_save_path, num_epochs, lr, cluster_num=10
     val_losses = []
     metrics = []
 
-    # 确定保存路径
     if script_dir is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
     folder_name = f"{total_folds}folds_{cluster_num}cluster_num"
@@ -162,12 +183,17 @@ def train(train_path, test_path, model_save_path, num_epochs, lr, cluster_num=10
     csv_path = os.path.join(csv_dir, csv_filename)
 
     for epoch in range(num_epochs):
+        # freeze阶段
+        if epoch == freeze_epochs:  # 到达解冻点
+            unfreeze_backbone(model)
+            optimizer = torch.optim.Adam(model.parameters(), lr = lr * 0.2, weight_decay = 5e-4)
+            scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+            print(f"==> Unfreezing backbone at epoch {epoch}, lowering lr.")
         train_loss = train_epoch(epoch, model, optimizer, trainloader, cluster_num, clinical_dim)
         valid_loss, val_ci, val_pvalue = prediction(model, valloader, cluster_num, clinical_dim, return_pvalue=True)
         scheduler.step(valid_loss)
         val_losses.append(valid_loss)
         early_stopping(valid_loss, model)
-        # 记录本epoch指标
         metrics.append({'epoch': epoch, 'train_loss': train_loss, 'val_loss': valid_loss, 'c_index': val_ci, 'p_value': val_pvalue})
         save_metrics_to_csv(metrics, csv_path)
         if early_stopping.early_stop:
