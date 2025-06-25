@@ -7,17 +7,16 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, utils
 from sklearn.model_selection import train_test_split
-from torch.utils.data import Dataset, DataLoader# 修改适配院内10%...
 
-def set_mil_seed(seed):   # 新增
+def set_mil_seed(seed):   
     global GLOBAL_MIL_SEED
     GLOBAL_MIL_SEED = seed
 
-def get_mil_seed():       # 新增
+def get_mil_seed():       
     global GLOBAL_MIL_SEED
     return GLOBAL_MIL_SEED if GLOBAL_MIL_SEED is not None else 666
 
-def worker_init_fn(worker_id):  # 新增
+def worker_init_fn(worker_id):  
     seed = get_mil_seed()
     np.random.seed(seed + worker_id)
     random.seed(seed + worker_id)
@@ -92,12 +91,24 @@ class MIL_dataset(Dataset):
             all_vgg = []
             vgg_clus = [[] for i in range(self.cluster_num)]
             Train_vgg_file = np.load(img_path)
-            cur_vgg = Train_vgg_file['vgg_features']
+            # ===== 支持 resnet_features 和 vgg_features =====
+            if 'resnet_features' in Train_vgg_file:
+                cur_vgg = Train_vgg_file['resnet_features']
+                vgg_feat_dim = 2048
+            else:
+                cur_vgg = Train_vgg_file['vgg_features']
+                vgg_feat_dim = 4096
             cur_patient = Train_vgg_file['pid']
             cur_time = Train_vgg_file['time']
             cur_status = Train_vgg_file['status']
             cur_path = Train_vgg_file['img_path']
             cur_cluster = Train_vgg_file['cluster_num']
+
+            # ==== 新增：读取临床参数 =====
+            cur_clinical_param = None
+            if 'clinical_param' in Train_vgg_file:
+                cur_clinical_param = Train_vgg_file['clinical_param']
+            # ===========================
 
             for id, each_patch_cls in enumerate(cur_cluster):
                 vgg_clus[each_patch_cls].append(cur_vgg[id])
@@ -107,7 +118,7 @@ class MIL_dataset(Dataset):
             mask = np.ones(self.cluster_num, dtype=np.float32)
             for i in range(self.cluster_num):
                 if len(vgg_clus[i]) == 0:
-                    clus_feat = np.zeros((1, 4096), dtype=np.float32)
+                    clus_feat = np.zeros((1, vgg_feat_dim), dtype=np.float32)
                     mask[i] = 0
                 else:
                     if self.random:
@@ -131,7 +142,14 @@ class MIL_dataset(Dataset):
             status_train = np.asarray(status_train)
             np_cls_num = np.asarray(cur_cluster)
 
-            sample = {'feat': all_vgg[0], 'mask':mask, 'time': surv_time_train[0], 'status':status_train[0], 'cluster_num': np_cls_num}
+            sample = {
+                'feat': all_vgg[0],
+                'mask': mask,
+                'time': surv_time_train[0],
+                'status': status_train[0],
+                'cluster_num': np_cls_num,
+                'clinical_param': cur_clinical_param # 新增
+            }
             if self.transform:
                 sample = self.transform(sample)
             return sample
@@ -144,9 +162,14 @@ class ToTensor(object):
         self.cluster_num = cluster_num
     def __call__(self, sample):
         image, time, status = sample['feat'], sample['time'], sample['status']
-        return {'feat': [torch.from_numpy(image[i]) for i in range(self.cluster_num)],
-                'time': torch.FloatTensor([time]),
-                'status': torch.FloatTensor([status]),
-                'mask': torch.from_numpy(sample['mask']),
-                'cluster_num': torch.from_numpy(sample['cluster_num'])
-                }
+        out = {
+            'feat': [torch.from_numpy(image[i]) for i in range(self.cluster_num)],
+            'time': torch.FloatTensor([time]),
+            'status': torch.FloatTensor([status]),
+            'mask': torch.from_numpy(sample['mask']),
+            'cluster_num': torch.from_numpy(sample['cluster_num'])
+        }
+        # ===== 新增：临床参数Tensor化 =====
+        if 'clinical_param' in sample and sample['clinical_param'] is not None:
+            out['clinical_param'] = torch.from_numpy(sample['clinical_param']).float()
+        return out
