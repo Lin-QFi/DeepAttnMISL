@@ -5,8 +5,7 @@ import random
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, utils
-from sklearn.model_selection import train_test_split
+from torchvision import transforms
 
 def set_mil_seed(seed):   
     global GLOBAL_MIL_SEED
@@ -38,6 +37,7 @@ class MIL_dataloader():
 
             def stratified_split(data_paths, statuses, test_size=0.1, random_state=66, max_retry=100):
                 for _ in range(max_retry):
+                    from sklearn.model_selection import train_test_split
                     train_paths, val_paths, train_st, val_st = train_test_split(
                         data_paths, statuses, test_size=test_size, random_state=random_state, shuffle=True, stratify=None)
                     if np.any(val_st == 1):
@@ -88,51 +88,47 @@ class MIL_dataset(Dataset):
             Batch_set = []
             surv_time_train = []
             status_train = []
-            all_vgg = []
-            vgg_clus = [[] for i in range(self.cluster_num)]
-            Train_vgg_file = np.load(img_path)
-            # ===== 支持 resnet_features 和 vgg_features =====
-            if 'resnet_features' in Train_vgg_file:
-                cur_vgg = Train_vgg_file['resnet_features']
-                vgg_feat_dim = 2048
-            else:
-                cur_vgg = Train_vgg_file['vgg_features']
-                vgg_feat_dim = 4096
-            cur_patient = Train_vgg_file['pid']
-            cur_time = Train_vgg_file['time']
-            cur_status = Train_vgg_file['status']
-            cur_path = Train_vgg_file['img_path']
-            cur_cluster = Train_vgg_file['cluster_num']
+            all_resnet = []
+            resnet_clus = [[] for i in range(self.cluster_num)]
+            npz_file = np.load(img_path)
+            # 只支持 resnet_features
+            cur_resnet = npz_file['resnet_features']
+            resnet_feat_dim = 2048
+            cur_patient = npz_file['pid']
+            cur_time = npz_file['time']
+            cur_status = npz_file['status']
+            cur_path = npz_file['img_path']
+            cur_cluster = npz_file['cluster_num']
 
             # ==== 新增：读取临床参数 =====
             cur_clinical_param = None
-            if 'clinical_param' in Train_vgg_file:
-                cur_clinical_param = Train_vgg_file['clinical_param']
+            if 'clinical_param' in npz_file:
+                cur_clinical_param = npz_file['clinical_param']
             # ===========================
 
             for id, each_patch_cls in enumerate(cur_cluster):
-                vgg_clus[each_patch_cls].append(cur_vgg[id])
+                resnet_clus[each_patch_cls].append(cur_resnet[id])
 
-            Batch_set.append((cur_vgg, cur_patient, cur_status, cur_time, cur_cluster))
-            np_vgg_fea = []
+            Batch_set.append((cur_resnet, cur_patient, cur_status, cur_time, cur_cluster))
+            np_resnet_fea = []
             mask = np.ones(self.cluster_num, dtype=np.float32)
             for i in range(self.cluster_num):
-                if len(vgg_clus[i]) == 0:
-                    clus_feat = np.zeros((1, vgg_feat_dim), dtype=np.float32)
+                if len(resnet_clus[i]) == 0:
+                    clus_feat = np.zeros((1, resnet_feat_dim), dtype=np.float32)
                     mask[i] = 0
                 else:
                     if self.random:
-                        curr_feat = vgg_clus[i]
+                        curr_feat = resnet_clus[i]
                         ind = np.arange(len(curr_feat))
                         np.random.seed(get_mil_seed())
                         np.random.shuffle(ind)
                         clus_feat = np.asarray([curr_feat[i] for i in ind])
                     else:
-                        clus_feat = np.asarray(vgg_clus[i])
+                        clus_feat = np.asarray(resnet_clus[i])
                 clus_feat = np.swapaxes(clus_feat, 1, 0)
                 clus_feat = np.expand_dims(clus_feat, 1)
-                np_vgg_fea.append(clus_feat)
-            all_vgg.append(np_vgg_fea)
+                np_resnet_fea.append(clus_feat)
+            all_resnet.append(np_resnet_fea)
 
             for each_set in Batch_set:
                 surv_time_train.append(each_set[3])
@@ -143,7 +139,7 @@ class MIL_dataset(Dataset):
             np_cls_num = np.asarray(cur_cluster)
 
             sample = {
-                'feat': all_vgg[0],
+                'feat': all_resnet[0],
                 'mask': mask,
                 'time': surv_time_train[0],
                 'status': status_train[0],
